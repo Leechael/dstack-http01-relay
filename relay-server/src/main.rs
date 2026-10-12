@@ -1,509 +1,316 @@
 mod dns;
 mod metrics;
+mod target;
 
 use axum::{
     body::Body,
-    extract::{Host, Path, Request, State},
-    http::{HeaderMap, Method, StatusCode},
-    response::{IntoResponse, Redirect, Response},
-    routing::any,
+    extract::{OriginalUri, Path, State},
+    http::{uri::Authority, HeaderMap, Method, StatusCode},
+    response::{IntoResponse, Response},
+    routing::get,
     Router,
 };
 use futures_util::StreamExt;
-use std::sync::Arc;
-use std::time::{Duration, Instant};
+use std::{sync::Arc, time::Instant};
 use tower_http::trace::TraceLayer;
-use tracing::{error, info, warn};
+use tracing::{error, info};
 use tracing_subscriber::{layer::SubscriberExt, util::SubscriberInitExt};
 
-use dns::DnsResolver;
-
-/// Relay mode configuration
-#[derive(Clone, Debug, PartialEq)]
-enum RelayMode {
-    /// Return 307 redirect to the target URL (default)
-    Redirect,
-    /// Proxy/tunnel traffic to the target URL
-    Proxy,
-}
-
-impl RelayMode {
-    fn from_env() -> Self {
-        match std::env::var("RELAY_MODE").as_deref() {
-            Ok("proxy") => RelayMode::Proxy,
-            Ok("redirect") => RelayMode::Redirect,
-            _ => RelayMode::Redirect, // Default
-        }
-    }
-}
-
-/// Shared application state
 #[derive(Clone)]
 struct AppState {
-    dns_resolver: Arc<DnsResolver>,
+    dns_resolver: Arc<dns::DnsResolver>,
     http_client: reqwest::Client,
-    relay_mode: RelayMode,
 }
 
 #[tokio::main]
 async fn main() {
-    // Load .env file if present (optional, won't fail if missing)
     let _ = dotenvy::dotenv();
-
-    // Initialize logging
     tracing_subscriber::registry()
         .with(
             tracing_subscriber::EnvFilter::try_from_default_env()
-                .unwrap_or_else(|_| "relay_server=info,tower_http=debug".into()),
+                .unwrap_or_else(|_| "relay_server=info".into()),
         )
         .with(tracing_subscriber::fmt::layer())
         .init();
-
-    // Initialize metrics
     metrics::init_metrics();
-    info!("Metrics initialized");
-
-    // Create DNS resolver
-    let dns_resolver = match DnsResolver::new() {
-        Ok(resolver) => Arc::new(resolver),
-        Err(e) => {
-            error!("Failed to create DNS resolver: {}", e);
-            std::process::exit(1);
-        }
-    };
-
-    info!("DNS resolver initialized");
-
-    // Determine relay mode
-    let relay_mode = RelayMode::from_env();
-    info!("Relay mode: {:?}", relay_mode);
-
-    // Create HTTP client with connection pooling for proxy mode
-    // This client is optimized for high traffic:
-    // - Connection pooling enabled by default
-    // - Timeouts configured to prevent hanging connections
-    // - TLS configured with rustls for better performance
-    let http_client = reqwest::Client::builder()
-        .pool_max_idle_per_host(100) // Keep up to 100 idle connections per host
-        .pool_idle_timeout(Duration::from_secs(90)) // Keep idle connections for 90 seconds
-        .connect_timeout(Duration::from_secs(10)) // Connection timeout
-        .timeout(Duration::from_secs(30)) // Overall request timeout
-        .build()
-        .expect("Failed to create HTTP client");
-
-    info!("HTTP client initialized with connection pooling");
-
-    // Create application state
+    // A narrowly scoped HTTP-01 bridge, not a general transparent proxy/redirector.
+    if std::env::var("RELAY_MODE").is_ok_and(|mode| mode != "proxy") {
+        error!("Only RELAY_MODE=proxy is supported by the hardened challenge-only relay");
+        std::process::exit(1);
+    }
+    let dns_resolver = Arc::new(dns::DnsResolver::new().expect("Invalid relay DNS policy"));
+    let http_client = dns::http_client(dns_resolver.clone()).expect("Failed to create HTTP client");
     let state = AppState {
         dns_resolver,
         http_client,
-        relay_mode,
     };
-
-    // Build the application router
-    let app = Router::new()
-        .route("/.well-known/acme-challenge/:token", any(acme_challenge_handler))
-        .route("/metrics", any(metrics_handler))
-        .route("/health", any(health_handler))
-        .route("/", any(root_handler))
-        .route("/*path", any(catch_all_handler))
-        .layer(TraceLayer::new_for_http())
-        .with_state(state);
-
-    // Get port from environment variable or use default 8081
+    let app = router(state);
     let port = std::env::var("PORT")
-        .ok()
-        .and_then(|p| p.parse::<u16>().ok())
-        .unwrap_or(8081);
-
-    let bind_addr = format!("0.0.0.0:{}", port);
-
-    // Bind to the configured port
-    let listener = match tokio::net::TcpListener::bind(&bind_addr).await {
-        Ok(listener) => listener,
-        Err(e) => {
-            error!("Failed to bind to {}: {}", bind_addr, e);
-            if port < 1024 {
-                error!("Port {} requires root/sudo permissions", port);
-            }
-            std::process::exit(1);
-        }
-    };
-
-    info!("Relay server listening on http://{}", bind_addr);
-    info!("Metrics endpoint: http://{}/metrics", bind_addr);
-    info!("Health endpoint: http://{}/health", bind_addr);
-
-    // Start the server
-    if let Err(e) = axum::serve(listener, app).await {
-        error!("Server error: {}", e);
-        std::process::exit(1);
-    }
+        .unwrap_or_else(|_| "8081".into())
+        .parse::<u16>()
+        .expect("Invalid PORT");
+    let listener = tokio::net::TcpListener::bind((std::net::Ipv4Addr::UNSPECIFIED, port))
+        .await
+        .expect("Failed to bind relay");
+    info!("Challenge-only relay listening on port {}", port);
+    axum::serve(listener, app)
+        .await
+        .expect("Relay server failed");
 }
 
-/// Handle ACME challenge requests
-/// This is the core function that implements the HTTP-01 challenge relay
+fn router(state: AppState) -> Router {
+    Router::new()
+        .route(
+            "/.well-known/acme-challenge/:token",
+            get(acme_challenge_handler),
+        )
+        .route(
+            "/metrics",
+            get(|| async {
+                (
+                    [("content-type", "text/plain; version=0.0.4")],
+                    metrics::gather_metrics(),
+                )
+            }),
+        )
+        .route("/health", get(|| async { "OK" }))
+        .layer(TraceLayer::new_for_http())
+        .with_state(state)
+}
+
 async fn acme_challenge_handler(
-    Host(hostname): Host,
+    headers: HeaderMap,
+    OriginalUri(uri): OriginalUri,
     Path(token): Path<String>,
     State(state): State<AppState>,
-    req: Request,
+    method: Method,
 ) -> Response {
     let start = Instant::now();
-    let path = format!("/.well-known/acme-challenge/{}", token);
-
-    // Extract method, headers, and body from request
-    let (parts, body) = req.into_parts();
-    let method = parts.method;
-    let headers = parts.headers;
-
-    info!(
-        "Received ACME challenge request for domain: {} token: {}",
-        hostname, token
-    );
-
-    // Increment metrics
-    metrics::inc_requests("GET", "/.well-known/acme-challenge/*", 200);
-
-    // Resolve the app URL using DNS
-    let app_url = match state.dns_resolver.resolve_app_url(&hostname, &path).await {
+    let path = format!("/.well-known/acme-challenge/{token}");
+    // Path extraction percent-decodes. Do not accept an encoded/noncanonical variant.
+    if target::validate_path(&path).is_err() || uri.path() != path || uri.query().is_some() {
+        return (StatusCode::BAD_REQUEST, "Invalid challenge path").into_response();
+    }
+    // Axum's Host extractor trusts Forwarded/X-Forwarded-Host. This listener may
+    // be reached directly: select only one literal Host header instead.
+    let mut hosts = headers.get_all("host").iter();
+    let hostname = match (hosts.next().and_then(|h| h.to_str().ok()), hosts.next()) {
+        (Some(hostname), None) => hostname,
+        _ => return (StatusCode::BAD_REQUEST, "Invalid Host").into_response(),
+    };
+    let authority = match hostname.parse::<Authority>() {
+        Ok(a) if !hostname.contains('@') && (a.port().is_none() || a.port_u16() == Some(80)) => a,
+        _ => return (StatusCode::BAD_REQUEST, "Invalid Host").into_response(),
+    };
+    let domain = authority.host().to_ascii_lowercase();
+    let url = match state.dns_resolver.resolve_app_url(&domain, &path).await {
         Ok(url) => {
-            info!("Successfully resolved app URL: {}", url);
             metrics::inc_dns_lookups("combined", "success");
             url
         }
         Err(e) => {
-            error!("Failed to resolve app URL for {}: {}", hostname, e);
             metrics::inc_dns_lookups("combined", "failure");
-            metrics::inc_redirects("failure");
-
-            let error_message = format!("Failed to resolve DNS records for {}: {}", hostname, e);
-            return (StatusCode::BAD_GATEWAY, error_message).into_response();
+            error!("Challenge destination rejected: {}", e);
+            return (StatusCode::BAD_GATEWAY, "Invalid challenge destination").into_response();
         }
     };
-
-    // Observe request duration for DNS resolution
-    let duration = start.elapsed().as_secs_f64();
-    metrics::observe_request_duration("GET", "/.well-known/acme-challenge/*", duration);
-
-    // Handle based on relay mode
-    match state.relay_mode {
-        RelayMode::Redirect => {
-            info!("Redirecting to: {}", app_url);
-            metrics::inc_redirects("success");
-
-            // Return a 307 Temporary Redirect to the app URL
-            Redirect::temporary(&app_url).into_response()
-        }
-        RelayMode::Proxy => {
-            info!("Proxying request to: {}", app_url);
-
-            // Proxy the request to the target URL, preserving the original request (including Host header)
-            match proxy_request(&state.http_client, &app_url, &method, &headers, body).await {
-                Ok(response) => {
-                    info!("Successfully proxied request to: {}", app_url);
-                    metrics::inc_redirects("success");
-                    response
-                }
-                Err(e) => {
-                    error!("Failed to proxy request to {}: {}", app_url, e);
-                    metrics::inc_redirects("failure");
-
-                    let error_message = format!("Failed to proxy request: {}", e);
-                    (StatusCode::BAD_GATEWAY, error_message).into_response()
-                }
-            }
-        }
-    }
+    // Preserve ONLY the validated custom Host for tenant virtual hosting.
+    // No caller credentials, cookies, body, forwarding headers or connection headers.
+    let method_label = if method == Method::HEAD {
+        "HEAD"
+    } else {
+        "GET"
+    };
+    let response = proxy_challenge(&state.http_client, url, method, &domain).await;
+    metrics::inc_requests(
+        method_label,
+        "/.well-known/acme-challenge/*",
+        response.status().as_u16(),
+    );
+    metrics::observe_request_duration(
+        method_label,
+        "/.well-known/acme-challenge/*",
+        start.elapsed().as_secs_f64(),
+    );
+    response
 }
 
-/// Proxy an HTTP request to the target URL
-/// This function handles the proxying with connection pooling and streaming
-async fn proxy_request(
+async fn proxy_challenge(
     client: &reqwest::Client,
-    target_url: &str,
-    method: &Method,
-    original_headers: &HeaderMap,
-    body: Body,
-) -> Result<Response, String> {
-    // Convert method
-    let req_method = match method.as_str() {
-        "GET" => reqwest::Method::GET,
-        "POST" => reqwest::Method::POST,
-        "PUT" => reqwest::Method::PUT,
-        "DELETE" => reqwest::Method::DELETE,
-        "HEAD" => reqwest::Method::HEAD,
-        "OPTIONS" => reqwest::Method::OPTIONS,
-        "PATCH" => reqwest::Method::PATCH,
-        _ => reqwest::Method::GET,
-    };
-
-    // Convert axum body to a stream and wrap for reqwest
-    // This avoids buffering the entire body in memory
-    let body_stream = body.into_data_stream().map(|result| {
-        result.map_err(|e| std::io::Error::new(std::io::ErrorKind::Other, e))
-    });
-    let reqwest_body = reqwest::Body::wrap_stream(body_stream);
-
-    // Build request with method and streaming body
-    let mut request_builder = client
-        .request(req_method, target_url)
-        .body(reqwest_body);
-
-    // Forward all headers, including Host, except hop-by-hop headers
-    for (key, value) in original_headers.iter() {
-        let key_str = key.as_str().to_lowercase();
-        // Skip hop-by-hop headers (but keep host and preserve upgrade/connection for upgrade handling)
-        if key_str != "transfer-encoding"
-            && key_str != "content-length"  // Let reqwest handle content-length
-            && key_str != "te"
-            && key_str != "trailer"
-            && key_str != "proxy-connection"
-            && key_str != "keep-alive" {
-            if let Ok(val) = value.to_str() {
-                request_builder = request_builder.header(key.as_str(), val);
-            }
-        }
-    }
-
-    // Send the request
-    let response = request_builder
-        .send()
-        .await
-        .map_err(|e| format!("Request failed: {}", e))?;
-
-    // Extract status code
-    let status = response.status();
-
-    // Extract headers to forward (filtering out connection-specific headers)
-    let mut headers = HeaderMap::new();
-    for (key, value) in response.headers() {
-        let key_str = key.as_str().to_lowercase();
-        // Skip connection-specific headers
-        if key_str != "connection"
-            && key_str != "transfer-encoding"
-            && key_str != "content-encoding"
-            && key_str != "content-length" {
-            if let Ok(val) = value.to_str() {
-                if let Ok(header_value) = val.parse() {
-                    headers.insert(key.clone(), header_value);
-                }
-            }
-        }
-    }
-
-    // Convert the response body to a stream
-    // This is important for handling large responses efficiently
-    let body_stream = response.bytes_stream();
-    let body = Body::from_stream(body_stream);
-
-    // Construct the response
-    let mut resp = Response::new(body);
-    *resp.status_mut() = status;
-    *resp.headers_mut() = headers;
-
-    Ok(resp)
-}
-
-/// Check if a request is an upgrade request (WebSocket, HTTP/2, etc.)
-fn is_upgrade_request(headers: &HeaderMap) -> bool {
-    headers.get("connection")
-        .and_then(|v| v.to_str().ok())
-        .map(|v| v.to_lowercase().contains("upgrade"))
-        .unwrap_or(false)
-}
-
-/// Helper function to handle requests with domain checking
-/// If Host is a dstack domain, relays to backend; otherwise calls the provided handler
-async fn handle_request_with_domain_check<F>(
-    state: &AppState,
-    path: &str,
-    req: Request,
-    non_dstack_handler: F,
-) -> Response
-where
-    F: FnOnce() -> Response,
-{
-    let (parts, body) = req.into_parts();
-
-    // Extract Host header
-    let hostname = parts.headers.get("host")
-        .and_then(|h| h.to_str().ok())
-        .unwrap_or("unknown")
-        .to_string();
-
-    // Check if this is a dstack custom domain
-    if state.dns_resolver.is_dstack_custom_domain(&hostname).await {
-        info!("Request for dstack domain {} at path {}, relaying to backend", hostname, path);
-
-        // Relay to the backend with full request
-        return relay_to_backend(state, &hostname, path, &parts.method, &parts.headers, body).await;
-    }
-
-    // Not a dstack domain - call the provided handler
-    info!("Request for non-dstack domain {} at path {}", hostname, path);
-    non_dstack_handler()
-}
-
-/// Helper function to relay a request to the backend
-async fn relay_to_backend(
-    state: &AppState,
-    hostname: &str,
-    path: &str,
-    method: &Method,
-    headers: &HeaderMap,
-    body: Body,
+    url: reqwest::Url,
+    method: Method,
+    domain: &str,
 ) -> Response {
-    // Check if this is an upgrade request
-    if is_upgrade_request(headers) {
-        warn!("Upgrade request detected for {} (WebSocket, HTTP/2, etc.)", hostname);
-
-        // For upgrade requests in proxy mode, we currently don't support them
-        // because reqwest doesn't handle protocol upgrades
-        if state.relay_mode == RelayMode::Proxy {
-            warn!("Protocol upgrades are not fully supported in proxy mode yet. Consider using redirect mode (RELAY_MODE=redirect) for WebSocket and other upgrade requests.");
-            return (
-                StatusCode::NOT_IMPLEMENTED,
-                "Protocol upgrades (WebSocket, HTTP/2) are not supported in proxy mode. Please use redirect mode (set RELAY_MODE=redirect) for upgrade requests."
-            ).into_response();
-        }
-    }
-
-    // Resolve the app URL using DNS
-    let app_url = match state.dns_resolver.resolve_app_url(hostname, path).await {
-        Ok(url) => {
-            info!("Successfully resolved app URL: {}", url);
-            url
+    match fetch_challenge(client, url, method, domain).await {
+        Ok(response) => {
+            // Retain the legacy counter name, which also counted proxy attempts.
+            metrics::inc_redirects("success");
+            response
         }
         Err(e) => {
-            error!("Failed to resolve app URL for {}: {}", hostname, e);
-            let error_message = format!("Failed to resolve DNS records for {}: {}", hostname, e);
-            return (StatusCode::BAD_GATEWAY, error_message).into_response();
-        }
-    };
-
-    // Handle based on relay mode
-    match state.relay_mode {
-        RelayMode::Redirect => {
-            info!("Redirecting to: {}", app_url);
-            Redirect::temporary(&app_url).into_response()
-        }
-        RelayMode::Proxy => {
-            info!("Proxying request to: {}", app_url);
-
-            // Proxy the request to the target URL, preserving the original request (including Host header)
-            match proxy_request(&state.http_client, &app_url, method, headers, body).await {
-                Ok(response) => {
-                    info!("Successfully proxied request to: {}", app_url);
-                    response
-                }
-                Err(e) => {
-                    error!("Failed to proxy request to {}: {}", app_url, e);
-                    let error_message = format!("Failed to proxy request: {}", e);
-                    (StatusCode::BAD_GATEWAY, error_message).into_response()
-                }
-            }
+            metrics::inc_redirects("failure");
+            error!("Challenge proxy failed: {}", e);
+            (StatusCode::BAD_GATEWAY, "Challenge upstream failed").into_response()
         }
     }
 }
 
-/// Metrics endpoint for Prometheus scraping
-/// Serves relay server metrics if Host is not a dstack domain, otherwise relays to backend
-async fn metrics_handler(
-    State(state): State<AppState>,
-    req: Request,
-) -> Response {
-    handle_request_with_domain_check(&state, "/metrics", req, || {
-        let metrics = metrics::gather_metrics();
-        (
-            StatusCode::OK,
-            [("content-type", "text/plain; version=0.0.4")],
-            metrics,
+async fn fetch_challenge(
+    client: &reqwest::Client,
+    url: reqwest::Url,
+    method: Method,
+    domain: &str,
+) -> Result<Response, String> {
+    if method != Method::GET && method != Method::HEAD {
+        return Err("unsupported challenge method".into());
+    }
+    let response = client
+        .request(method, url)
+        .header("host", domain)
+        .send()
+        .await
+        .map_err(|e| e.to_string())?;
+    if response.status() != StatusCode::OK {
+        // Including 3xx: never follow it and never relay Location to the ACME validator.
+        return Err(format!(
+            "upstream status {} is not a challenge response",
+            response.status()
+        ));
+    }
+    let mut data = Vec::new();
+    let mut stream = response.bytes_stream();
+    while let Some(chunk) = stream.next().await {
+        let chunk = chunk.map_err(|e| e.to_string())?;
+        if data.len() + chunk.len() > 8192 {
+            return Err("challenge response too large".into());
+        }
+        data.extend_from_slice(&chunk);
+    }
+    Ok((
+        StatusCode::OK,
+        [
+            ("content-type", "text/plain"),
+            ("cache-control", "no-store"),
+        ],
+        Body::from(data),
+    )
+        .into_response())
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use tower::ServiceExt;
+
+    // invariant: public entry points cannot relay arbitrary paths/methods or decoded delimiters.
+    #[tokio::test]
+    async fn router_rejects_non_challenge_requests_before_dns() {
+        let resolver = Arc::new(dns::tests::resolver());
+        let client = dns::http_client(resolver.clone()).unwrap();
+        let app = router(AppState {
+            dns_resolver: resolver,
+            http_client: client,
+        });
+        let cases = [
+            (
+                Method::GET,
+                "/logs/foo",
+                "tenant.example",
+                StatusCode::NOT_FOUND,
+            ),
+            (
+                Method::POST,
+                "/.well-known/acme-challenge/abcdefghijklmnopqrstuvwxyz",
+                "tenant.example",
+                StatusCode::METHOD_NOT_ALLOWED,
+            ),
+            (
+                Method::GET,
+                "/.well-known/acme-challenge/abcdefghijklmnopqrstuvwxyz%2Fsecret",
+                "tenant.example",
+                StatusCode::BAD_REQUEST,
+            ),
+            (
+                Method::GET,
+                "/.well-known/acme-challenge/abcdefghijklmnopqrstuvwxyz?url=http://localhost",
+                "tenant.example",
+                StatusCode::BAD_REQUEST,
+            ),
+            (
+                Method::GET,
+                "/.well-known/acme-challenge/short",
+                "tenant.example",
+                StatusCode::BAD_REQUEST,
+            ),
+            (
+                Method::GET,
+                "/.well-known/acme-challenge/abcdefghijklmnopqrstuvwxyz",
+                "user@tenant.example",
+                StatusCode::BAD_REQUEST,
+            ),
+            (
+                Method::GET,
+                "/.well-known/acme-challenge/abcdefghijklmnopqrstuvwxyz",
+                "tenant.example:443",
+                StatusCode::BAD_REQUEST,
+            ),
+        ];
+        for (method, uri, host, status) in cases {
+            let request = axum::http::Request::builder()
+                .method(method)
+                .uri(uri)
+                .header("host", host)
+                .body(Body::empty())
+                .unwrap();
+            assert_eq!(
+                app.clone().oneshot(request).await.unwrap().status(),
+                status,
+                "{uri} {host}"
+            );
+        }
+    }
+
+    // regression: actual transport must not make a request to an upstream redirect target.
+    #[tokio::test]
+    async fn upstream_redirect_is_not_followed_or_returned() {
+        use std::sync::atomic::{AtomicUsize, Ordering};
+        let hits = Arc::new(AtomicUsize::new(0));
+        let h = hits.clone();
+        let app = Router::new()
+            .route(
+                "/first",
+                get(|| async { (StatusCode::FOUND, [("location", "/second")], "") }),
+            )
+            .route(
+                "/second",
+                get(move || {
+                    let h = h.clone();
+                    async move {
+                        h.fetch_add(1, Ordering::SeqCst);
+                        "secret"
+                    }
+                }),
+            );
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let address = listener.local_addr().unwrap();
+        let server = tokio::spawn(async move {
+            axum::serve(listener, app).await.unwrap();
+        });
+        // Loopback is test-only here: isolate redirect transport behavior from destination policy.
+        let client = dns::http_client_builder()
+            .https_only(false)
+            .build()
+            .unwrap();
+        let response = proxy_challenge(
+            &client,
+            format!("http://{address}/first").parse().unwrap(),
+            Method::GET,
+            "test.example",
         )
-            .into_response()
-    })
-    .await
-}
-
-/// Health check endpoint
-/// Serves relay server health if Host is not a dstack domain, otherwise relays to backend
-async fn health_handler(
-    State(state): State<AppState>,
-    req: Request,
-) -> Response {
-    handle_request_with_domain_check(&state, "/health", req, || {
-        (StatusCode::OK, "OK").into_response()
-    })
-    .await
-}
-
-/// Root handler for the "/" path
-/// Acts as transparent proxy/redirector for dstack domains, serves info page for relay server
-async fn root_handler(
-    State(state): State<AppState>,
-    req: Request,
-) -> Response {
-    let relay_mode = state.relay_mode.clone();
-    handle_request_with_domain_check(&state, "/", req, move || {
-        let mode_description = match relay_mode {
-        RelayMode::Redirect => "307 redirect (default)",
-        RelayMode::Proxy => "HTTP proxy/tunnel",
-    };
-
-        let info = format!(
-            r#"
-dstack HTTP-01 ACME Challenge Relay Server
-
-This server relays ACME HTTP-01 challenges to dstack applications.
-
-Current Mode: {}
-
-Endpoints:
-- /.well-known/acme-challenge/:token - ACME challenge endpoint
-- /metrics - Prometheus metrics
-- /health - Health check
-
-How it works:
-1. Let's Encrypt requests http://{{custom-domain}}/.well-known/acme-challenge/{{token}}
-2. This server looks up DNS records:
-   - TXT _dstack-app-address.{{custom-domain}} -> {{app-id}}:port
-   - CNAME {{custom-domain}} -> _.{{gateway-base-domain}}
-3. In redirect mode: Returns 307 redirect to https://{{app-id}}.{{gateway-base-domain}}/.well-known/acme-challenge/{{token}}
-   In proxy mode: Proxies the request directly to the target HTTPS endpoint
-4. The ACME client in dstack responds with the challenge
-
-Proxy Mode Features:
-- Connection pooling (up to 100 idle connections per host)
-- Request streaming for efficient memory usage
-- Configured timeouts for reliability
-- Optimized for high traffic scenarios
-
-Status: Running
-"#,
-            mode_description
-        );
-
-        (StatusCode::OK, info).into_response()
-    })
-    .await
-}
-
-/// Catch-all handler for any path not matched by specific routes (except /)
-/// Acts as transparent proxy/redirector for dstack domains, returns 404 for relay server
-async fn catch_all_handler(
-    State(state): State<AppState>,
-    Path(path): Path<String>,
-    req: Request,
-) -> Response {
-    // Normalize path (add leading slash if needed)
-    let normalized_path = if path.starts_with('/') {
-        path
-    } else {
-        format!("/{}", path)
-    };
-
-    handle_request_with_domain_check(&state, &normalized_path, req, || {
-        (StatusCode::NOT_FOUND, "Not Found").into_response()
-    })
-    .await
+        .await;
+        assert_eq!(response.status(), StatusCode::BAD_GATEWAY);
+        assert!(!response.headers().contains_key("location"));
+        assert_eq!(hits.load(Ordering::SeqCst), 0);
+        server.abort();
+    }
 }

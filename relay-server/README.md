@@ -1,5 +1,31 @@
 # HTTP-01 ACME Challenge Relay Server
 
+> **Security hold (2026-10-13): do not deploy or restart the published `latest`
+> image.** It is vulnerable to SSRF. The local source changes are an **undeployed
+> hardening draft**, not a released image. Historical run/Compose instructions
+> below do not configure the draft and must not be used to restore service.
+>
+> The draft requires `ALLOWED_GATEWAY_DOMAINS` containing exact approved gateway
+> bases. CNAME must exactly equal `_.<approved-base>` (DNS case/root-dot normalized).
+> Regex extraction and fallback are removed; missing/unmatched CNAME is rejected.
+> There is no incoming custom-domain registration requirement.
+> It serves GET/HEAD only at
+> `/.well-known/acme-challenge/<base64url-token>`; the token must be 22–256 bytes.
+> TXT app IDs must be 40 lowercase hexadecimal characters with a numeric nonzero
+> port; the port remains ignored as before (gateway default guest HTTP port 80).
+> Arbitrary paths, app-ID port selectors, redirect mode, upstream redirects and
+> non-public destination IPs are rejected. Incoming forwarding headers are ignored.
+> Only the validated custom Host is forwarded. Health and metrics remain local
+> relay endpoints, never proxies.
+>
+> Before any approved deployment: inventory legacy HTTP-01 tenants, test their
+> challenge responders, pass the new policy environment variable, bind the host
+> listener to loopback behind nginx, add egress controls, pin a reviewed image
+> digest, and verify a reproducible container build. The current Dockerfile uses
+> Rust 1.83 with unlocked dependencies; the local test run used Rust 1.95 and is
+> not proof that the Dockerfile builds. Node-ops automation quarantine is tracked
+> separately. Prefer DNS-01 or suitable TLS-ALPN-01 migration over restoration.
+
 A Rust-based relay server that receives HTTP-01 ACME challenges on port 80, performs DNS lookups, and redirects to dstack applications running on HTTPS.
 
 ## How It Works

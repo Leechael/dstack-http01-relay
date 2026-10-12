@@ -22,9 +22,6 @@ futures-util = "0.3"
 # DNS resolution
 hickory-resolver = "0.24"
 
-# Regex for domain validation
-regex = "1.10"
-
 # Metrics
 prometheus = "0.13"
 

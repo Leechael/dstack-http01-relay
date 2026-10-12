@@ -28,12 +28,9 @@ COPY --from=builder /app/target/release/relay-server /app/relay-server
 # Expose port 8081 (default) - can be overridden with PORT env var
 EXPOSE 8081
 
-# Set default environment variables
+# ALLOWED_GATEWAY_DOMAINS is required at runtime; never authorize gateways by default.
 ENV RUST_LOG=relay_server=info \
-    PORT=8081 \
-    FALLBACK_GATEWAY_DOMAIN=prod5.phala.network \
-    ALLOWED_DOMAIN_REGEX='^_\.(.+\.phala\.network)$' \
-    GATEWAY_DOMAIN_CAPTURE_GROUP=1
+    PORT=8081
 
 # Run the binary
 CMD ["/app/relay-server"]
