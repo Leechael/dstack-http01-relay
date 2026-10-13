@@ -4,6 +4,7 @@ certbot/
 # Rust build artifacts
 target/
 Cargo.lock
+!/relay-server/Cargo.lock
 
 # Environment variables
 .env

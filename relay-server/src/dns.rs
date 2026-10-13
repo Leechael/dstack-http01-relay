@@ -1,218 +1,309 @@
-use hickory_resolver::config::{ResolverConfig, ResolverOpts};
-use hickory_resolver::proto::rr::RecordType;
-use hickory_resolver::TokioAsyncResolver;
-use regex::Regex;
-use std::error::Error;
-use std::fmt;
-use tracing::{debug, info, warn};
+use crate::target::{public_ip, valid_domain, TargetPolicy};
+use hickory_resolver::{
+    config::{LookupIpStrategy, ResolverConfig, ResolverOpts},
+    proto::rr::RecordType,
+    TokioAsyncResolver,
+};
+use reqwest::{
+    dns::{Addrs, Name, Resolve, Resolving},
+    Url,
+};
+use std::{error::Error, net::SocketAddr, sync::Arc};
 
-#[derive(Debug)]
-pub enum DnsError {
-    LookupFailed(String),
-    NoRecordsFound(String),
-    ParseError(String),
-}
+type DnsError = Box<dyn Error + Send + Sync>;
 
-impl fmt::Display for DnsError {
-    fn fmt(&self, f: &mut fmt::Formatter) -> fmt::Result {
-        match self {
-            DnsError::LookupFailed(msg) => write!(f, "DNS lookup failed: {}", msg),
-            DnsError::NoRecordsFound(msg) => write!(f, "No DNS records found: {}", msg),
-            DnsError::ParseError(msg) => write!(f, "Failed to parse DNS record: {}", msg),
-        }
-    }
-}
-
-impl Error for DnsError {}
-
-/// DNS resolver for looking up dstack app configuration
+/// DNS configuration is operator-owned; DNS records themselves are untrusted.
 pub struct DnsResolver {
     resolver: TokioAsyncResolver,
-    fallback_gateway_domain: Option<String>,
-    allowed_domain_regex: Option<Regex>,
-    gateway_domain_capture_group: usize,
+    policy: TargetPolicy,
 }
 
 impl DnsResolver {
-    /// Create a new DNS resolver with default configuration
     pub fn new() -> Result<Self, DnsError> {
-        let resolver = TokioAsyncResolver::tokio(ResolverConfig::default(), ResolverOpts::default());
-
-        // Read environment variables
-        let fallback_gateway_domain = std::env::var("FALLBACK_GATEWAY_DOMAIN").ok();
-
-        // ALLOWED_DOMAIN_REGEX should include a capture group to extract the gateway domain
-        // Default: ^_\.(.+\.phala\.network)$ - matches "_.prod5.phala.network" and captures "prod5.phala.network"
-        let allowed_domain_regex = std::env::var("ALLOWED_DOMAIN_REGEX")
-            .ok()
-            .or_else(|| Some(r"^_\.(.+\.phala\.network)$".to_string()))
-            .and_then(|pattern| {
-                Regex::new(&pattern).ok()
-            });
-
-        // Which capture group to use for extracting the gateway domain (default: 1)
-        let gateway_domain_capture_group = std::env::var("GATEWAY_DOMAIN_CAPTURE_GROUP")
-            .ok()
-            .and_then(|s| s.parse::<usize>().ok())
-            .unwrap_or(1);
-
-        if let Some(ref domain) = fallback_gateway_domain {
-            info!("Using fallback gateway domain: {}", domain);
-        }
-
-        if let Some(ref regex) = allowed_domain_regex {
-            info!("Using allowed domain regex: {} (capture group {} will be used as gateway domain)", regex.as_str(), gateway_domain_capture_group);
-        }
-
+        let policy = TargetPolicy::new(&std::env::var("ALLOWED_GATEWAY_DOMAINS")?)?;
         Ok(Self {
-            resolver,
-            fallback_gateway_domain,
-            allowed_domain_regex,
-            gateway_domain_capture_group,
+            resolver: TokioAsyncResolver::tokio(ResolverConfig::default(), resolver_options()),
+            policy,
         })
     }
 
-    /// Look up the TXT record for _dstack-app-address.{domain}
-    /// Returns the app-id and port in format "app-id:port"
-    pub async fn lookup_app_address(&self, domain: &str) -> Result<(String, String), DnsError> {
-        let txt_domain = format!("_dstack-app-address.{}", domain);
-
-        info!("Looking up TXT record for: {}", txt_domain);
-
-        let response = self.resolver.txt_lookup(&txt_domain)
-            .await
-            .map_err(|e| DnsError::LookupFailed(format!("TXT lookup failed for {}: {}", txt_domain, e)))?;
-
-        // Get the first TXT record
-        let record = response.iter().next()
-            .ok_or_else(|| DnsError::NoRecordsFound(format!("No TXT records for {}", txt_domain)))?;
-
-        // Parse the TXT record - it should be in format "app-id:port"
-        let txt_value = record.to_string();
-        debug!("Found TXT record: {}", txt_value);
-
-        let parts: Vec<&str> = txt_value.split(':').collect();
-        if parts.len() != 2 {
-            return Err(DnsError::ParseError(format!(
-                "Expected 'app-id:port' format, got: {}",
-                txt_value
-            )));
+    async fn lookup_app_address(&self, domain: &str) -> Result<String, DnsError> {
+        let response = self
+            .resolver
+            .txt_lookup(format!("_dstack-app-address.{domain}"))
+            .await?;
+        let mut records = response.iter();
+        let record = records.next().ok_or("missing app TXT record")?;
+        if records.next().is_some() {
+            return Err("ambiguous app TXT records".into());
         }
-
-        Ok((parts[0].to_string(), parts[1].to_string()))
+        // DNS TXT strings may be split into chunks. Concatenate raw bytes, not escaped Display.
+        let bytes: Vec<u8> = record
+            .txt_data()
+            .iter()
+            .flat_map(|part| part.iter().copied())
+            .collect();
+        let value = String::from_utf8(bytes)?;
+        let (app, port) = value.split_once(':').ok_or("expected app-id:port")?;
+        // The legacy relay ignored this port and reached the gateway's default guest port 80.
+        // Keep that routing, but don't accept arbitrary strings in either field.
+        let port = port.parse::<u16>()?;
+        if port == 0 {
+            return Err("invalid app port".into());
+        }
+        Ok(app.to_owned())
     }
 
-    /// Look up the CNAME record for {domain}
-    /// Returns the gateway base domain (e.g., "_.prod5.phala.network" or "prod5.phala.network")
-    /// Falls back to FALLBACK_GATEWAY_DOMAIN if CNAME doesn't match ALLOWED_DOMAIN_REGEX
-    pub async fn lookup_gateway_domain(&self, domain: &str) -> Result<String, DnsError> {
-        info!("Looking up CNAME record for: {}", domain);
-
-        let cname_result = self.resolver.lookup(domain, RecordType::CNAME).await;
-
-        let gateway_domain = match cname_result {
-            Ok(response) => {
-                // Get the first CNAME record
-                let record = response.record_iter().next()
-                    .ok_or_else(|| DnsError::NoRecordsFound(format!("No CNAME records for {}", domain)))?;
-
-                let cname_value = record.data()
-                    .ok_or_else(|| DnsError::NoRecordsFound(format!("CNAME record has no data for {}", domain)))?
-                    .as_cname()
-                    .ok_or_else(|| DnsError::ParseError(format!("Expected CNAME record for {}", domain)))?
-                    .to_string();
-
-                debug!("Found CNAME record: {}", cname_value);
-
-                // Extract gateway domain (remove trailing dot if present)
-                let gateway = cname_value.trim_end_matches('.').to_string();
-
-                // Check if CNAME matches the allowed domain regex and extract gateway domain
-                if let Some(ref regex) = self.allowed_domain_regex {
-                    if let Some(captures) = regex.captures(&gateway) {
-                        // Try to get the specified capture group (the gateway domain)
-                        if let Some(captured_gateway) = captures.get(self.gateway_domain_capture_group) {
-                            let extracted_domain = captured_gateway.as_str().to_string();
-                            info!("CNAME '{}' matches allowed domain regex, extracted gateway from group {}: {}",
-                                  gateway, self.gateway_domain_capture_group, extracted_domain);
-                            extracted_domain
-                        } else {
-                            // Capture group doesn't exist, use the whole match
-                            warn!("CNAME '{}' matches regex but capture group {} not found, using whole match",
-                                  gateway, self.gateway_domain_capture_group);
-                            gateway
-                        }
-                    } else {
-                        warn!("CNAME '{}' does not match allowed domain regex", gateway);
-                        // Fall back to fallback domain
-                        if let Some(ref fallback) = self.fallback_gateway_domain {
-                            warn!("Using fallback gateway domain: {}", fallback);
-                            fallback.clone()
-                        } else {
-                            return Err(DnsError::ParseError(format!(
-                                "CNAME '{}' does not match allowed domain regex and no fallback configured",
-                                gateway
-                            )));
-                        }
-                    }
-                } else {
-                    // No regex check, use CNAME as-is (strip "_." prefix if present)
-                    if gateway.starts_with("_.") {
-                        gateway[2..].to_string()
-                    } else {
-                        gateway
-                    }
-                }
-            }
-            Err(e) => {
-                warn!("CNAME lookup failed for {}: {}", domain, e);
-                // Fall back to fallback domain
-                if let Some(ref fallback) = self.fallback_gateway_domain {
-                    warn!("Using fallback gateway domain: {}", fallback);
-                    fallback.clone()
-                } else {
-                    return Err(DnsError::LookupFailed(format!("CNAME lookup failed for {}: {}", domain, e)));
-                }
-            }
-        };
-
-        Ok(gateway_domain)
+    async fn lookup_gateway_domain(&self, domain: &str) -> Result<String, DnsError> {
+        // Lookup failure is an error, never permission to use a fallback gateway.
+        let response = self.resolver.lookup(domain, RecordType::CNAME).await?;
+        let mut records = response.record_iter().filter(|record| {
+            record
+                .name()
+                .to_string()
+                .trim_end_matches('.')
+                .eq_ignore_ascii_case(domain)
+                && record.data().and_then(|data| data.as_cname()).is_some()
+        });
+        let record = records.next().ok_or("missing direct CNAME")?;
+        if records.next().is_some() {
+            return Err("ambiguous direct CNAME records".into());
+        }
+        let cname = record
+            .data()
+            .and_then(|data| data.as_cname())
+            .ok_or("expected CNAME")?
+            .to_string();
+        self.gateway_from_cname(&cname)
     }
 
-    /// Resolve the complete app URL for a given custom domain
-    /// Returns the full https:// URL to redirect to
-    pub async fn resolve_app_url(&self, custom_domain: &str, path: &str) -> Result<String, DnsError> {
-        info!("Resolving app URL for domain: {} with path: {}", custom_domain, path);
-
-        // Look up both TXT and CNAME records
-        let (app_id, _port) = self.lookup_app_address(custom_domain).await?;
-        let gateway_domain = self.lookup_gateway_domain(custom_domain).await?;
-
-        // Construct the full URL: https://{app-id}.{gateway-domain}{path}
-        let app_url = format!("https://{}.{}{}", app_id, gateway_domain, path);
-
-        info!("Resolved app URL: {}", app_url);
-        Ok(app_url)
+    fn gateway_from_cname(&self, cname: &str) -> Result<String, DnsError> {
+        // DNS names are case-insensitive; accept one DNS root dot, not arbitrary suffixes.
+        let cname = cname
+            .strip_suffix('.')
+            .unwrap_or(cname)
+            .to_ascii_lowercase();
+        let gateway = cname
+            .strip_prefix("_.")
+            .ok_or("CNAME must be _.<approved gateway>")?;
+        // Exact membership validates the entire remainder, not a regex/suffix fragment.
+        self.policy.gateway(gateway)?;
+        Ok(gateway.to_owned())
     }
 
-    /// Check if a domain is a dstack custom domain by verifying DNS records exist
-    /// Returns true if both TXT and CNAME records are found
-    pub async fn is_dstack_custom_domain(&self, domain: &str) -> bool {
-        // Try to resolve the app address (TXT record)
-        let has_txt = self.lookup_app_address(domain).await.is_ok();
-
-        // We only need to check TXT record - if it exists, it's a dstack custom domain
-        has_txt
+    pub async fn resolve_app_url(&self, custom_domain: &str, path: &str) -> Result<Url, DnsError> {
+        let domain = custom_domain.to_ascii_lowercase();
+        if !valid_domain(&domain) || domain.parse::<std::net::IpAddr>().is_ok() {
+            return Err("invalid custom domain".into());
+        }
+        let app = self.lookup_app_address(&domain).await?;
+        let gateway = self.lookup_gateway_domain(&domain).await?;
+        Ok(self.policy.url(&app, &gateway, path)?)
     }
 }
 
-#[cfg(test)]
-mod tests {
-    use super::*;
+fn resolver_options() -> ResolverOpts {
+    let mut options = ResolverOpts::default();
+    options.ip_strategy = LookupIpStrategy::Ipv4AndIpv6;
+    options
+}
 
+/// Validate DNS results in the connector itself: no check-then-resolve rebinding gap.
+impl Resolve for DnsResolver {
+    fn resolve(&self, name: Name) -> Resolving {
+        let resolver = self.resolver.clone();
+        let policy = self.policy.clone();
+        let host = name.as_str().to_owned();
+        Box::pin(async move {
+            policy.host(&host)?;
+            let response = resolver.lookup_ip(host).await?;
+            checked_addresses(response.iter().map(|ip| SocketAddr::new(ip, 0)).collect())
+        })
+    }
+}
+
+fn checked_addresses(addresses: Vec<SocketAddr>) -> Result<Addrs, DnsError> {
+    if addresses.is_empty() || addresses.iter().any(|a| !public_ip(a.ip())) {
+        return Err("DNS destination is not exclusively public unicast".into());
+    }
+    Ok(Box::new(addresses.into_iter()))
+}
+
+pub fn http_client(resolver: Arc<DnsResolver>) -> Result<reqwest::Client, reqwest::Error> {
+    http_client_builder().dns_resolver(resolver).build()
+}
+
+pub fn http_client_builder() -> reqwest::ClientBuilder {
+    reqwest::Client::builder()
+        .https_only(true)
+        .no_proxy() // Environment proxies would bypass the checked destination resolver.
+        .redirect(reqwest::redirect::Policy::none())
+        .connect_timeout(std::time::Duration::from_secs(10))
+        .timeout(std::time::Duration::from_secs(30))
+}
+
+#[cfg(test)]
+pub(crate) mod tests {
+    use super::*;
+    pub(crate) fn resolver() -> DnsResolver {
+        DnsResolver {
+            resolver: TokioAsyncResolver::tokio(ResolverConfig::default(), resolver_options()),
+            policy: TargetPolicy::new("dstack-pha-prod2.phala.network").unwrap(),
+        }
+    }
+
+    // invariant: only the exact _.<approved gateway> DNS name is accepted; no fallback.
+    #[tokio::test]
+    async fn cname_policy() {
+        let r = resolver();
+        assert_eq!(
+            r.gateway_from_cname("_.dstack-pha-prod2.phala.network")
+                .unwrap(),
+            "dstack-pha-prod2.phala.network"
+        );
+        assert_eq!(
+            r.gateway_from_cname("_.DSTACK-PHA-PROD2.PHALA.NETWORK.")
+                .unwrap(),
+            "dstack-pha-prod2.phala.network"
+        );
+        for cname in [
+            "_.google.com#.dstack-pha-prod2.phala.network",
+            "_.user@dstack-pha-prod2.phala.network",
+            "_.evil.phala.network",
+            "_.localhost#.dstack-pha-prod2.phala.network",
+            "tdx-lab-pub.phala.systems",
+            "dstack-pha-prod2.phala.network",
+            "_.dstack-pha-prod2.phala.network.evil.com",
+            "extra._.dstack-pha-prod2.phala.network",
+            "_.dstack-pha-prod2.phala.network..",
+            "_.dstack-pha-prod2.phala.network:443",
+            "_.dstack-pha-prod2.phala.network/",
+        ] {
+            assert!(r.gateway_from_cname(cname).is_err(), "{cname}");
+        }
+    }
+
+    // invariant: the production Resolve implementation sees both families and rejects
+    // rebinding/mixed/private answers; no external DNS or network targets are used.
+    #[tokio::test]
+    async fn connector_dns_policy_with_local_dns() {
+        use hickory_resolver::{
+            config::NameServerConfigGroup,
+            proto::{
+                op::{Message, MessageType},
+                rr::{
+                    rdata::{A, AAAA},
+                    RData, Record,
+                },
+            },
+        };
+        use std::sync::atomic::{AtomicUsize, Ordering};
+        let socket = tokio::net::UdpSocket::bind("127.0.0.1:0").await.unwrap();
+        let port = socket.local_addr().unwrap().port();
+        let phase = Arc::new(AtomicUsize::new(0));
+        let p = phase.clone();
+        let server = tokio::spawn(async move {
+            let mut buffer = [0; 4096];
+            loop {
+                let (len, peer) = socket.recv_from(&mut buffer).await.unwrap();
+                let query = Message::from_vec(&buffer[..len]).unwrap();
+                let q = query.queries()[0].clone();
+                let mut answer = Message::new();
+                answer
+                    .set_id(query.id())
+                    .set_message_type(MessageType::Response)
+                    .set_recursion_desired(true)
+                    .set_recursion_available(true)
+                    .add_query(q.clone());
+                let data = match (p.load(Ordering::SeqCst), q.query_type()) {
+                    (1, RecordType::A) => Some(RData::A(A("127.0.0.1".parse().unwrap()))),
+                    (_, RecordType::A) => Some(RData::A(A("66.220.6.102".parse().unwrap()))),
+                    (2, RecordType::AAAA) => Some(RData::AAAA(AAAA("::1".parse().unwrap()))),
+                    (_, RecordType::AAAA) => {
+                        Some(RData::AAAA(AAAA("2606:4700:4700::1111".parse().unwrap())))
+                    }
+                    _ => None,
+                };
+                if let Some(data) = data {
+                    answer.add_answer(Record::from_rdata(q.name().clone(), 0, data));
+                }
+                socket
+                    .send_to(&answer.to_vec().unwrap(), peer)
+                    .await
+                    .unwrap();
+            }
+        });
+        let mut r = resolver();
+        let mut opts = resolver_options();
+        opts.cache_size = 0;
+        r.resolver = TokioAsyncResolver::tokio(
+            ResolverConfig::from_parts(
+                None,
+                vec![],
+                NameServerConfigGroup::from_ips_clear(&["127.0.0.1".parse().unwrap()], port, false),
+            ),
+            opts,
+        );
+        let host = "5b912f5cec6c02d851db76bc20f410700f01fc65.dstack-pha-prod2.phala.network";
+        let addresses = r
+            .resolve(host.parse().unwrap())
+            .await
+            .unwrap()
+            .collect::<Vec<_>>();
+        assert_eq!(addresses.len(), 2);
+        assert!(addresses.iter().any(|a| a.is_ipv4()));
+        assert!(addresses.iter().any(|a| a.is_ipv6()));
+        phase.store(1, Ordering::SeqCst);
+        assert_eq!(
+            r.resolve(host.parse().unwrap())
+                .await
+                .err()
+                .unwrap()
+                .to_string(),
+            "DNS destination is not exclusively public unicast"
+        );
+        phase.store(2, Ordering::SeqCst);
+        assert_eq!(
+            r.resolve(host.parse().unwrap())
+                .await
+                .err()
+                .unwrap()
+                .to_string(),
+            "DNS destination is not exclusively public unicast"
+        );
+        // Actual reqwest connector must fail before connecting to the returned loopback A.
+        phase.store(1, Ordering::SeqCst);
+        let sink = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let sink_port = sink.local_addr().unwrap().port();
+        let client = http_client(Arc::new(r)).unwrap();
+        // Explicit port is test-only, to count connections; production TargetPolicy rejects ports.
+        let error = client
+            .get(format!(
+                "https://{host}:{sink_port}/.well-known/acme-challenge/abcdefghijklmnopqrstuvwxyz"
+            ))
+            .send()
+            .await
+            .unwrap_err();
+        assert!(error.is_connect());
+        assert!(format!("{error:?}").contains("DNS destination is not exclusively public unicast"));
+        assert!(
+            tokio::time::timeout(std::time::Duration::from_millis(20), sink.accept())
+                .await
+                .is_err()
+        );
+        server.abort();
+    }
+
+    // invariant: mixed DNS answers fail closed, not just a filtered subset.
     #[test]
-    fn test_dns_resolver_creation() {
-        let resolver = DnsResolver::new();
-        assert!(resolver.is_ok());
+    fn dns_answers() {
+        let good = "66.220.6.102:443".parse().unwrap();
+        let bad = "127.0.0.1:443".parse().unwrap();
+        assert_eq!(
+            checked_addresses(vec![good]).unwrap().collect::<Vec<_>>(),
+            vec![good]
+        );
+        assert!(checked_addresses(vec![good, bad]).is_err());
+        assert!(checked_addresses(vec![]).is_err());
     }
 }
