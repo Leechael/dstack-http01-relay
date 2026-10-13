@@ -1,0 +1,108 @@
+name: Build and publish hardened relay
+
+on:
+  push:
+    branches: [build/ghcr-relay]
+    paths:
+      - relay-server/**
+      - .github/workflows/relay-ghcr.yml
+  workflow_dispatch:
+
+permissions:
+  contents: read
+  packages: write
+
+concurrency:
+  group: relay-ghcr-${{ github.ref }}
+  cancel-in-progress: false
+
+env:
+  IMAGE: ghcr.io/leechael/dstack-http01-relay-server
+
+jobs:
+  publish:
+    if: github.repository == 'Leechael/dstack-http01-relay'
+    runs-on: ubuntu-24.04
+    timeout-minutes: 30
+    steps:
+      - name: Checkout
+        uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4
+        with:
+          persist-credentials: false
+
+      - name: Install pinned Rust
+        uses: dtolnay/rust-toolchain@686976e191b89faba57d3206551f0f330d8cb249 # stable
+        with:
+          toolchain: 1.95.0
+          components: clippy
+
+      - name: Test and lint locked dependencies
+        working-directory: relay-server
+        run: |
+          cargo test --locked
+          cargo clippy --locked --all-targets -- -D warnings
+
+      - name: Set up Buildx
+        uses: docker/setup-buildx-action@8d2750c68a42422c14e847fe6c8ac0403b4cbd6f # v3
+
+      - name: Build image for smoke testing
+        uses: docker/build-push-action@10e90e3645eae34f1e60eeb005ba3a3d33f178e8 # v6
+        with:
+          context: ./relay-server
+          platforms: linux/amd64
+          load: true
+          tags: ${{ env.IMAGE }}:sha-${{ github.sha }}
+          labels: |
+            org.opencontainers.image.source=${{ github.server_url }}/${{ github.repository }}
+            org.opencontainers.image.revision=${{ github.sha }}
+            org.opencontainers.image.title=dstack-http01-relay-server
+
+      - name: Smoke test container before publishing
+        shell: bash
+        run: |
+          set -euo pipefail
+          image="$IMAGE:sha-$GITHUB_SHA"
+          if docker run --rm "$image"; then
+            echo 'ERROR: relay started without its mandatory gateway allowlist'
+            exit 1
+          fi
+          trap 'docker logs relay-smoke; docker rm -f relay-smoke' EXIT
+          docker run -d --name relay-smoke \
+            -p 127.0.0.1:18081:8081 \
+            -e ALLOWED_GATEWAY_DOMAINS=dstack-pha-prod2.phala.network \
+            "$image"
+          curl --fail --retry 10 --retry-delay 1 --retry-connrefused http://127.0.0.1:18081/health
+          test "$(curl -s -o /dev/null -w '%{http_code}' http://127.0.0.1:18081/logs/foo)" = 404
+          test "$(curl -s -o /dev/null -w '%{http_code}' -X POST http://127.0.0.1:18081/.well-known/acme-challenge/abcdefghijklmnopqrstuvwxyz)" = 405
+          test "$(curl -s -o /dev/null -w '%{http_code}' -H 'Host: tenant.example' http://127.0.0.1:18081/.well-known/acme-challenge/short)" = 400
+
+      - name: Log in to GHCR
+        uses: docker/login-action@c94ce9fb468520275223c153574b00df6fe4bcc9 # v3
+        with:
+          registry: ghcr.io
+          username: ${{ github.actor }}
+          password: ${{ secrets.GITHUB_TOKEN }}
+
+      - name: Publish tested image
+        shell: bash
+        run: |
+          set -euo pipefail
+          immutable="$IMAGE:sha-$GITHUB_SHA"
+          docker push "$immutable"
+          docker tag "$immutable" "$IMAGE:hardened"
+          docker push "$IMAGE:hardened"
+          digest_ref=$(docker image inspect "$immutable" --format '{{index .RepoDigests 0}}')
+          {
+            echo '## Hardened relay image (linux/amd64)'
+            echo "- Commit tag: \`$immutable\`"
+            echo "- Digest: \`$digest_ref\`"
+            echo '- Use the digest for deployment. Publishing does not deploy/restart any service.'
+            echo '- ALLOWED_GATEWAY_DOMAINS is required; regex extraction and fallback are removed.'
+          } >> "$GITHUB_STEP_SUMMARY"
+          printf '%s\n' "$digest_ref" > image-digest.txt
+
+      - name: Upload immutable image reference
+        uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02 # v4
+        with:
+          name: relay-image-digest
+          path: image-digest.txt

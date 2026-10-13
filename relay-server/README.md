@@ -21,10 +21,25 @@
 > Before any approved deployment: inventory legacy HTTP-01 tenants, test their
 > challenge responders, pass the new policy environment variable, bind the host
 > listener to loopback behind nginx, add egress controls, pin a reviewed image
-> digest, and verify a reproducible container build. The current Dockerfile uses
-> Rust 1.83 with unlocked dependencies; the local test run used Rust 1.95 and is
-> not proof that the Dockerfile builds. Node-ops automation quarantine is tracked
-> separately. Prefer DNS-01 or suitable TLS-ALPN-01 migration over restoration.
+> digest, and verify the container build. This branch pins Rust 1.95, base image
+> digests and Cargo.lock; a successful GHCR workflow includes Linux tests and
+> container smoke tests. Node-ops automation quarantine is tracked separately.
+> Prefer DNS-01 or suitable TLS-ALPN-01 migration over restoration.
+
+## Fork GHCR build
+
+The `build/ghcr-relay` branch in `Leechael/dstack-http01-relay` runs
+`.github/workflows/relay-ghcr.yml`. It tests locked dependencies, builds a
+non-root `linux/amd64` image, checks that missing gateway policy prevents startup,
+and smoke-tests health and challenge-only routing before publishing:
+
+- `ghcr.io/leechael/dstack-http01-relay-server:sha-<full-commit-sha>`
+- `ghcr.io/leechael/dstack-http01-relay-server:hardened` (moving tag)
+
+The workflow summary and `relay-image-digest` artifact contain the immutable
+`ghcr.io/leechael/dstack-http01-relay-server@sha256:...` reference. Use that digest
+for any separately approved deployment, with explicit `ALLOWED_GATEWAY_DOMAINS`.
+This workflow does not deploy or restart production. It does not publish `latest`.
 
 A Rust-based relay server that receives HTTP-01 ACME challenges on port 80, performs DNS lookups, and redirects to dstack applications running on HTTPS.
 
